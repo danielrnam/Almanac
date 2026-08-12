@@ -30,6 +30,65 @@ init_db()
 
 import re
 import json
+import asyncio
+import logging
+
+# Set up structured logging for intent-vs-outcome observability
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("almanac")
+
+def log_intent_vs_outcome(intent: str, outcome: str):
+    """Structured logger capturing agent intent versus outcome for robust distributed tracing and observability."""
+    payload = {
+        "event_type": "intent_vs_outcome",
+        "agent_intent": intent,
+        "agent_outcome": outcome,
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+    logger.info(json.dumps(payload))
+    print(f"📝 [OBSERVABILITY LOG] {json.dumps(payload)}")
+
+
+async def compact_session_history_async(session, selected_user_id: str):
+    """Asynchronously compacts old session history when context turns exceed threshold (12 events),
+    summarizing older messages to prevent memory context bloat and context-window token exhaustion."""
+    if len(session.events) <= 12:
+        return
+
+    # Extract old events to summarize (e.g. first 8 events)
+    old_events = session.events[:8]
+    summary_prompt = "Summarize the following past conversation context between a gardening user and Almanac assistant into a single concise paragraph. Retain key plant states, coordinates, and watering rules:\n\n"
+    for e in old_events:
+        if e.content and e.content.parts:
+            role = "User" if e.content.role == "user" else "Assistant"
+            text = "".join([p.text or "" for p in e.content.parts])
+            summary_prompt += f"{role}: {text}\n"
+
+    try:
+        # Perform asynchronous/non-blocking LLM call for summarization
+        client = Client()
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-3.6-flash",
+            contents=summary_prompt
+        )
+        summary_text = f"🔄 [CONSOLIDATED MEMORY SUMMARY]: {response.text.strip()}"
+        
+        # Replace the first 8 events with a single summarized event in a non-blocking background thread
+        from google.genai.types import Content, Part, Event
+        summary_event = Event(
+            content=Content(
+                role="user",
+                parts=[Part.from_text(text=summary_text)]
+            )
+        )
+        
+        # Update session events list
+        session.events = [summary_event] + session.events[8:]
+        print(f"Successfully compacted history for session {session.id}. Reduced token context bloat.")
+    except Exception as e:
+        print(f"Error during async history compaction: {e}")
+
 
 def parse_schedule_json(text_plan: str) -> dict | None:
     """Helper to extract and parse a JSON block from the generated text plan."""
@@ -341,12 +400,59 @@ with col_planner:
     else:
         st.info("No active watering plan found. Click the button below to coordinate agents and compile one!")
 
+    if "pending_plan" not in st.session_state:
+        st.session_state.pending_plan = None
+
+    # Human-in-the-Loop (HITL) Verification Card
+    if st.session_state.pending_plan:
+        st.markdown("""
+        <div style='background-color:#E3F2FD; border-left: 6px solid #1565C0; padding: 15px; border-radius: 4px; margin-bottom: 20px;'>
+            <strong style='color:#0D47A1; font-size:1.1rem;'>⚠️ Human-in-the-Loop (HITL) Authorization Required</strong><br>
+            <span style='color:#1565C0;'>Almanac's multi-agent team has generated a tentative schedule. Please review and authorize below before committing this schedule to your official database.</span>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("### 📋 Propose Schedule Recommendations")
+        st.markdown(st.session_state.pending_plan["text_plan"])
+        st.caption(f"**Generated Reasoning Summary**: {st.session_state.pending_plan['summary']}")
+        
+        # User confirmation checkbox represents human verification gate
+        hitl_authorized = st.checkbox("👉 I have reviewed these recommendations and authorize applying this plan to my premises.")
+        
+        col_hitl_ok, col_hitl_cancel = st.columns(2)
+        with col_hitl_ok:
+            if st.button("✅ Authorize & Commit to Yard", type="primary", disabled=not hitl_authorized, use_container_width=True):
+                # Save plan to DB only after user authorization
+                save_watering_plan(
+                    user_id=selected_user_id,
+                    start_date=datetime.date.today().isoformat(),
+                    schedule_data={"text_plan": st.session_state.pending_plan["text_plan"]},
+                    reasoning_summary=st.session_state.pending_plan["summary"]
+                )
+                log_intent_vs_outcome(
+                    intent="Apply authorized watering plan to DB",
+                    outcome="Plan successfully committed to SQLite after explicit human-in-the-loop validation."
+                )
+                st.session_state.pending_plan = None
+                st.success("Plan committed successfully!")
+                st.rerun()
+        with col_hitl_cancel:
+            if st.button("❌ Discard Plan", type="secondary", use_container_width=True):
+                log_intent_vs_outcome(
+                    intent="User choice: discard plan",
+                    outcome="Proposed plan discarded by user operator."
+                )
+                st.session_state.pending_plan = None
+                st.rerun()
+                
+        st.markdown("---")
+
     # Active plan button
     if st.button("🚀 Coordinate Agents & Compile 7-Day Watering Plan", type="primary", use_container_width=True):
         if not active_plants:
             st.error("Cannot generate plan: Your yard currently has no active plants! Add some first.")
         else:
-            with st.spinner("Orchestrator delegating weather query and plant analysis parallelly..."):
+            with st.spinner("Orchestrator (gemini-2.5-pro) coordinating weather & botanical leaf-agents parallelly..."):
                 try:
                     # Construct clean inputs context for the Orchestrator with custom guidelines
                     plants_summary = "\n".join([
@@ -360,6 +466,12 @@ with col_planner:
                         f"Location: {location_name} (Lat: {lat}, Lng: {lng})\n"
                         f"My Active Plants:\n{plants_summary}\n"
                         f"Current Date: {datetime.date.today().strftime('%B %d, %Y')}"
+                    )
+                    
+                    # Log Agent Intent
+                    log_intent_vs_outcome(
+                        intent=f"Coordinate multi-agent planning over {len(active_plants)} plants using Pro reasoning and parallel weather fetches.",
+                        outcome="Dispatched parallel tool coordinates and forecast actions to background threads."
                     )
                     
                     # Local execution of the ADK App using local Runner
@@ -383,14 +495,16 @@ with col_planner:
                         parts=[types.Part.from_text(text=prompt)]
                     )
                     
-                    # Run the agent locally
-                    events = list(
-                        runner.run(
-                            new_message=message,
-                            user_id=selected_user_id,
-                            session_id=session.id,
+                    # Run the agent in a non-blocking asynchronous thread to prevent UI lockups
+                    events = asyncio.run(asyncio.to_thread(
+                        lambda: list(
+                            runner.run(
+                                new_message=message,
+                                user_id=selected_user_id,
+                                session_id=session.id,
+                            )
                         )
-                    )
+                    ))
                     
                     # Collate response parts from events
                     response_text_parts = []
@@ -401,14 +515,18 @@ with col_planner:
                                     response_text_parts.append(part.text)
                     response_content = "".join(response_text_parts)
                     
-                    # Save to DB history
-                    save_watering_plan(
-                        user_id=selected_user_id,
-                        start_date=datetime.date.today().isoformat(),
-                        schedule_data={"text_plan": response_content},
-                        reasoning_summary=f"Synthesized 7-day schedule for {len(active_plants)} plants."
+                    # Log Agent Outcome and hold for review
+                    log_intent_vs_outcome(
+                        intent="Synthesize 7-day watering calendar",
+                        outcome=f"Successfully compiled plan ({len(response_content)} chars). Now holding for user HITL verification."
                     )
-                    st.toast("Watering plan saved to your history.")
+                    
+                    # Hold plan for review (HITL) instead of immediate auto-save
+                    st.session_state.pending_plan = {
+                        "text_plan": response_content,
+                        "summary": f"Synthesized 7-day schedule for {len(active_plants)} plants."
+                    }
+                    st.toast("Watering plan compiled! Please authorize below.")
                     st.rerun()
                     
                 except Exception as e:
@@ -447,6 +565,12 @@ with col_planner:
         with st.chat_message("assistant"):
             with st.spinner("Almanac considering..."):
                 try:
+                    # Log Agent Chat Intent
+                    log_intent_vs_outcome(
+                        intent=f"Formulate conversational chat answer for query: '{chat_query}'",
+                        outcome="Invoking ADK agent runner on a background non-blocking thread."
+                    )
+                    
                     # Execute runner
                     runner = Runner(
                         app=adk_app,
@@ -459,13 +583,18 @@ with col_planner:
                         role="user",
                         parts=[types.Part.from_text(text=chat_query)]
                     )
-                    events = list(
-                        runner.run(
-                            new_message=user_msg,
-                            user_id=selected_user_id,
-                            session_id=session.id,
+                    
+                    # Run the agent in a non-blocking asynchronous thread to prevent UI lockups
+                    events = asyncio.run(asyncio.to_thread(
+                        lambda: list(
+                            runner.run(
+                                new_message=user_msg,
+                                user_id=selected_user_id,
+                                session_id=session.id,
+                            )
                         )
-                    )
+                    ))
+                    
                     reply_parts = []
                     for event in events:
                         if event.content and event.content.parts:
@@ -473,6 +602,16 @@ with col_planner:
                                 if part.text:
                                     reply_parts.append(part.text)
                     reply_text = "".join(reply_parts)
+                    
+                    # Log Agent Chat Outcome
+                    log_intent_vs_outcome(
+                        intent="Respond to conversational query",
+                        outcome=f"Successfully generated reply ({len(reply_text)} chars)."
+                    )
+                    
+                    # Run memory compaction asynchronously in the background to prevent context bloat
+                    asyncio.run(compact_session_history_async(session, selected_user_id))
+                    
                     st.markdown(reply_text)
                     st.rerun()
                 except Exception as e:

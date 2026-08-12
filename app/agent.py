@@ -8,13 +8,15 @@ from google.genai import types
 
 from app.tools import get_coordinates, get_7_day_forecast
 
-MODEL = "gemini-3.6-flash"
+# Strategic Model Routing: Use high-reasoning Gemini Pro for Root/Orchestration and fast Gemini Flash for leaf Specialists
+SPECIALIST_MODEL = "gemini-3.6-flash"
+PLANNING_MODEL = "gemini-2.5-pro"
 
 # 1. Weather Forecast Agent
 weather_forecast_agent = Agent(
     name="weather_forecast_agent",
     model=Gemini(
-        model=MODEL,
+        model=SPECIALIST_MODEL,
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     instruction=(
@@ -31,7 +33,7 @@ weather_forecast_agent = Agent(
 plant_analyst_agent = Agent(
     name="plant_analyst_agent",
     model=Gemini(
-        model=MODEL,
+        model=SPECIALIST_MODEL,
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     instruction=(
@@ -47,7 +49,7 @@ plant_analyst_agent = Agent(
 root_agent = Agent(
     name="orchestrator_agent",
     model=Gemini(
-        model=MODEL,
+        model=PLANNING_MODEL,
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     instruction=(

@@ -3,6 +3,20 @@ import json
 import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+import re
+
+def redact_pii(text: Optional[str]) -> Optional[str]:
+    """Detects and redacts potential PII (emails, phone numbers, standard credit card sequences)
+    to protect privacy before storing any user-supplied or AI-generated strings in the database."""
+    if not text:
+        return text
+    # Redact email addresses
+    text = re.sub(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", "[REDACTED_EMAIL]", text)
+    # Redact phone numbers (standard US/international numeric sequences)
+    text = re.sub(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b", "[REDACTED_PHONE]", text)
+    # Redact standard credit card number groups
+    text = re.sub(r"\b(?:\d[ -]*?){13,16}\b", "[REDACTED_CARD]", text)
+    return text
 
 DB_FILE = "almanac.db"
 
@@ -70,6 +84,7 @@ def init_db():
 def save_user_profile(user_id: str, location_name: str, latitude: float, longitude: float):
     conn = get_connection()
     cursor = conn.cursor()
+    clean_location = redact_pii(location_name)
     cursor.execute("""
     INSERT INTO user_profile (user_id, location_name, latitude, longitude)
     VALUES (?, ?, ?, ?)
@@ -77,7 +92,7 @@ def save_user_profile(user_id: str, location_name: str, latitude: float, longitu
         location_name = excluded.location_name,
         latitude = excluded.latitude,
         longitude = excluded.longitude
-    """, (user_id, location_name, latitude, longitude))
+    """, (user_id, clean_location, latitude, longitude))
     conn.commit()
     conn.close()
 
@@ -96,10 +111,12 @@ def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
 def add_plant(user_id: str, name: str, maturity: str, health_state: str, photo_path: Optional[str] = None, watering_guidelines: Optional[str] = None):
     conn = get_connection()
     cursor = conn.cursor()
+    clean_name = redact_pii(name)
+    clean_guidelines = redact_pii(watering_guidelines)
     cursor.execute("""
     INSERT INTO plants (user_id, name, maturity, health_state, photo_path, watering_guidelines)
     VALUES (?, ?, ?, ?, ?, ?)
-    """, (user_id, name, maturity, health_state, photo_path, watering_guidelines))
+    """, (user_id, clean_name, maturity, health_state, photo_path, clean_guidelines))
     conn.commit()
     conn.close()
 
@@ -134,11 +151,21 @@ def get_active_plants(user_id: str) -> List[Dict[str, Any]]:
 def save_watering_plan(user_id: str, start_date: str, schedule_data: Dict[str, Any], reasoning_summary: str):
     conn = get_connection()
     cursor = conn.cursor()
-    schedule_json = json.dumps(schedule_data)
+    
+    # Redact PII in schedule_data text fields and reasoning summaries
+    clean_reasoning = redact_pii(reasoning_summary)
+    clean_schedule = {}
+    for k, v in schedule_data.items():
+        if isinstance(v, str):
+            clean_schedule[k] = redact_pii(v)
+        else:
+            clean_schedule[k] = v
+            
+    schedule_json = json.dumps(clean_schedule)
     cursor.execute("""
     INSERT INTO watering_plans (user_id, start_date, schedule_data, reasoning_summary)
     VALUES (?, ?, ?, ?)
-    """, (user_id, start_date, schedule_json, reasoning_summary))
+    """, (user_id, start_date, schedule_json, clean_reasoning))
     conn.commit()
     conn.close()
 
